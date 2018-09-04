@@ -238,9 +238,12 @@ struct _lws_http_mode_related {
 
 #if defined(LWS_WITH_HTTP_PROXY)
 	unsigned int perform_rewrite:1;
+	unsigned int proxy_clientside:1;
+	unsigned int proxy_parent_chunked:1;
 #endif
 	unsigned int deferred_transaction_completed:1;
 	unsigned int content_length_explicitly_zero:1;
+	unsigned int did_stream_close:1;
 };
 
 

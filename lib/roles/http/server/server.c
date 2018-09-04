@@ -223,7 +223,7 @@ done_list:
 			}
 #endif
 #endif
-		lws_plat_set_socket_options(vhost, sockfd);
+		lws_plat_set_socket_options(vhost, sockfd, 0);
 
 		is = lws_socket_bind(vhost, sockfd, vhost->listen_port, vhost->iface);
 		/*
@@ -236,9 +236,15 @@ done_list:
 			compatible_close(sockfd);
 			goto deal;
 		}
-		vhost->listen_port = is;
+#ifdef LWS_WITH_UNIX_SOCK
+		if (!LWS_UNIX_SOCK_ENABLED(vhost))
+#endif
+		{
+			vhost->listen_port = is;
 
-		lwsl_debug("%s: lws_socket_bind says %d\n", __func__, is);
+			lwsl_debug("%s: lws_socket_bind says %d\n", __func__,
+					is);
+		}
 
 		wsi = lws_zalloc(sizeof(struct lws), "listen wsi");
 		if (wsi == NULL) {
@@ -327,7 +333,7 @@ lws_select_vhost(struct lws_context *context, int port, const char *servername)
 	vhost = context->vhost_list;
 	while (vhost) {
 		m = (int)strlen(vhost->name);
-		if (port == vhost->listen_port &&
+		if (port && port == vhost->listen_port &&
 		    m <= (colon - 2) &&
 		    servername[colon - m - 1] == '.' &&
 		    !strncmp(vhost->name, servername + colon - m, m)) {
@@ -342,7 +348,7 @@ lws_select_vhost(struct lws_context *context, int port, const char *servername)
 
 	vhost = context->vhost_list;
 	while (vhost) {
-		if (port == vhost->listen_port) {
+		if (port && port == vhost->listen_port) {
 			lwsl_info("%s: vhost match to %s based on port %d\n",
 					__func__, vhost->name, port);
 			return vhost;
@@ -1079,7 +1085,7 @@ lws_http_action(struct lws *wsi)
 		unsigned char *start = pt->serv_buf + LWS_PRE,
 			      *p = start, *end = p + 512;
 
-		lwsl_debug("Doing 301 '%s' org %s\n", s, hit->origin);
+		lwsl_info("Doing 301 '%s' org %s\n", s, hit->origin);
 
 		/* > at start indicates deal with by redirect */
 		if (hit->origin_protocol == LWSMPRO_REDIR_HTTP ||
@@ -1162,14 +1168,20 @@ lws_http_action(struct lws *wsi)
 	 * The mount is a reverse proxy?
 	 */
 
+	// lwsl_notice("%s: origin_protocol: %d\n", __func__, hit->origin_protocol);
+
 	if (hit->origin_protocol == LWSMPRO_HTTPS ||
 	    hit->origin_protocol == LWSMPRO_HTTP)  {
 		struct lws_client_connect_info i;
-		char ads[96], rpath[256], *pcolon, *pslash, *p;
+		struct lws *cwsi;
+		char ads[96], rpath[256], *pcolon, *pslash, *p, unix_skt = 0;
 		int n, na;
 
 		memset(&i, 0, sizeof(i));
 		i.context = lws_get_context(wsi);
+
+		if (hit->origin[0] == '+')
+			unix_skt = 1;
 
 		pcolon = strchr(hit->origin, ':');
 		pslash = strchr(hit->origin, '/');
@@ -1178,16 +1190,28 @@ lws_http_action(struct lws *wsi)
 				 hit->origin);
 			return -1;
 		}
-		if (pcolon > pslash)
-			pcolon = NULL;
 
-		if (pcolon)
-			n = pcolon - hit->origin;
-		else
-			n = pslash - hit->origin;
+		if (unix_skt) {
+			if (!pcolon) {
+				lwsl_err("Proxy mount origin for unix skt must "
+					 "have address delimited by :\n");
 
-		if (n >= (int)sizeof(ads) - 2)
-			n = sizeof(ads) - 2;
+				return -1;
+			}
+			n = lws_ptr_diff(pcolon, hit->origin);
+			pslash = pcolon;
+		} else {
+			if (pcolon > pslash)
+				pcolon = NULL;
+
+			if (pcolon)
+				n = pcolon - hit->origin;
+			else
+				n = pslash - hit->origin;
+
+			if (n >= (int)sizeof(ads) - 2)
+				n = sizeof(ads) - 2;
+		}
 
 		memcpy(ads, hit->origin, n);
 		ads[n] = '\0';
@@ -1217,24 +1241,47 @@ lws_http_action(struct lws *wsi)
 			}
 		}
 
-
 		i.path = rpath;
-		i.host = i.address;
+		if (i.address[0] != '+' ||
+		    !lws_hdr_simple_ptr(wsi, WSI_TOKEN_HOST))
+			i.host = i.address;
+		else
+			i.host = lws_hdr_simple_ptr(wsi, WSI_TOKEN_HOST);
 		i.origin = NULL;
 		i.method = "GET";
+		i.alpn = "http/1.1";
 		i.parent_wsi = wsi;
-		i.uri_replace_from = hit->origin;
-		i.uri_replace_to = hit->mountpoint;
+		i.pwsi = &cwsi;
 
-		lwsl_notice("proxying to %s port %d url %s, ssl %d, "
+	//	i.uri_replace_from = hit->origin;
+	//	i.uri_replace_to = hit->mountpoint;
+
+		lwsl_info("proxying to %s port %d url %s, ssl %d, "
 			    "from %s, to %s\n",
 			    i.address, i.port, i.path, i.ssl_connection,
 			    i.uri_replace_from, i.uri_replace_to);
 
 		if (!lws_client_connect_via_info(&i)) {
 			lwsl_err("proxy connect fail\n");
+
+			/*
+			 * ... we can't do the proxy action, but we can
+			 * cleanly return him a 503 and a description
+			 */
+
+			lws_return_http_status(wsi,
+				HTTP_STATUS_SERVICE_UNAVAILABLE,
+				"<h1>Service Temporarily Unavailable</h1>"
+				"The server is temporarily unable to service "
+				"your request due to maintenance downtime or "
+				"capacity problems. Please try again later.");
+
 			return 1;
 		}
+
+		lwsl_info("%s: setting proxy clientside on %p (parent %p)\n",
+			  __func__, cwsi, lws_get_parent(cwsi));
+		cwsi->http.proxy_clientside = 1;
 
 		return 0;
 	}
@@ -1531,7 +1578,8 @@ raw_transition:
 
 		/* select vhost */
 
-		if (lws_hdr_total_length(wsi, WSI_TOKEN_HOST)) {
+		if (wsi->vhost->listen_port &&
+		    lws_hdr_total_length(wsi, WSI_TOKEN_HOST)) {
 			struct lws_vhost *vhost = lws_select_vhost(
 				context, wsi->vhost->listen_port,
 				lws_hdr_simple_ptr(wsi, WSI_TOKEN_HOST));

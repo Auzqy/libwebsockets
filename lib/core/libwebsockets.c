@@ -2394,7 +2394,7 @@ lws_parse_uri(char *p, const char **prot, const char **ads, int *port,
 	      const char **path)
 {
 	const char *end;
-	static const char *slash = "/";
+	char unix_skt = 0;
 
 	/* cut up the location into address, port and path */
 	*prot = p;
@@ -2408,32 +2408,32 @@ lws_parse_uri(char *p, const char **prot, const char **ads, int *port,
 		*p = '\0';
 		p += 3;
 	}
+	if (*p == '+') /* unix skt */
+		unix_skt = 1;
+
 	*ads = p;
 	if (!strcmp(*prot, "http") || !strcmp(*prot, "ws"))
 		*port = 80;
 	else if (!strcmp(*prot, "https") || !strcmp(*prot, "wss"))
 		*port = 443;
 
-       if (*p == '[')
-       {
-               ++(*ads);
-               while (*p && *p != ']')
-                       p++;
-               if (*p)
-                       *p++ = '\0';
-       }
-       else
-       {
-               while (*p && *p != ':' && *p != '/')
-                       p++;
-       }
+	if (*p == '[') {
+		++(*ads);
+		while (*p && *p != ']')
+			p++;
+		if (*p)
+			*p++ = '\0';
+	} else
+		while (*p && *p != ':' && (unix_skt || *p != '/'))
+			p++;
+
 	if (*p == ':') {
 		*p++ = '\0';
 		*port = atoi(p);
 		while (*p && *p != '/')
 			p++;
 	}
-	*path = slash;
+	*path = "/";
 	if (*p) {
 		*p++ = '\0';
 		if (*p)
